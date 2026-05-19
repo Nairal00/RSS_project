@@ -1,0 +1,8 @@
+feedparser
+openai
+beautifulsoup4
+lxml
+jinja2
+python-dotenv
+pytest
+pytest-cov

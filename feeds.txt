@@ -1,0 +1,6 @@
+# RSS feed URLs — one per line
+# Lines starting with # are ignored
+# Techmeme is auto-detected by URL containing "techmeme.com"
+https://www.techmeme.com/feed.xml
+https://openai.com/news/rss.xml 
+https://developers.googleblog.com/feeds/posts/default

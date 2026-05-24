@@ -30,8 +30,14 @@ Perform a security audit checking for:
 - Insecure direct object references
 - Path traversal vulnerabilities
 
-## Output
-For each issue found, provide:
+
+## Output Format
+Provide issues as a numbered list with severity:
+- [CRITICAL] - Must fix before merge
+- [HIGH] - Should fix before merge
+- [MEDIUM] - Should address soon
+- [LOW] - Nice to have
+With the following details for each issue:
 1. File and line number
 2. Vulnerability type
 3. Severity (CRITICAL/HIGH/MEDIUM/LOW)

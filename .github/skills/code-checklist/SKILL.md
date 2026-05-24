@@ -1,7 +1,6 @@
 ---
 name: code-checklist
 description: Comprehensive code quality checklist with security, performance, and maintainability checks
-license: MIT
 ---
 
 # Code Checklist

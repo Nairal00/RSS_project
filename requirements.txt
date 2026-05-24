@@ -1,8 +1,7 @@
-feedparser
-openai
-beautifulsoup4
-lxml
-jinja2
-python-dotenv
-pytest
-pytest-cov
+feedparser==6.0.12
+requests==2.34.2
+python-dotenv==1.2.2
+pytest==9.0.3
+pytest-cov==7.1.0
+flake8==7.3.0
+pylint==4.0.5

@@ -1,6 +1,7 @@
-# RSS feed URLs — one per line
-# Lines starting with # are ignored
-# Techmeme is auto-detected by URL containing "techmeme.com"
-https://www.techmeme.com/feed.xml
-https://openai.com/news/rss.xml 
-https://developers.googleblog.com/feeds/posts/default
+# RSS feed URLs 
+Anthropic_Eng=https://raw.githubusercontent.com/Olshansk/rss-feeds/main/feeds/feed_anthropic_engineering.xml
+Anthropic_Research=https://raw.githubusercontent.com/Olshansk/rss-feeds/main/feeds/feed_anthropic_research.xml
+Cursor=https://raw.githubusercontent.com/Olshansk/rss-feeds/main/feeds/feed_cursor.xml
+Google_AI=https://raw.githubusercontent.com/Olshansk/rss-feeds/main/feeds/feed_google_ai.xml
+OpenAI_Blog=https://openai.com/blog/rss.xml
+DeepMind=https://deepmind.google/blog/rss.xml

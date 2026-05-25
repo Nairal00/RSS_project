@@ -10,6 +10,7 @@ A Python CLI script that fetches multiple RSS feeds within a given time range, u
 |---|---|
 | `feedparser` | Parse RSS/Atom feeds |
 | `requests` | Fetch article content via Jina AI reader |
+| `openai` | DeepSeek API calls (OpenAI-compatible SDK) |
 | `pytest` | Test framework |
 | `pytest-cov` | Test coverage |
 | `flake8~=7.1.1` | Linting |
@@ -29,7 +30,7 @@ A Python CLI script that fetches multiple RSS feeds within a given time range, u
    - If an article's published time field is missing or malformed, log an error with the article title and link; skip the article; collect the error for final output display.
 6. All functions must have type hints.
 
-**Done when**: Console prints all titles(if any) and their link; private IP URLs rejected; bad feed requests show error code and message. If no update found in any of the feeds, display no update from the particular source. Tests written for: normal feed, private IP rejection, empty feed, missing `feeds.txt`, empty article link, malformed publised time and empty or broken link field.
+**Done when**: private IP URLs rejected; bad feed requests show error code and message. If no update found in any of the feeds, display no update from the particular source. Tests written for: normal feed, private IP rejection, empty feed, missing `feeds.txt`, empty article link, malformed publised time and empty or broken link field.
 
 ## Sprint 2 — Extract the header and message from the given link
 **Goal**: Extract the header and message from the given link.
@@ -40,19 +41,31 @@ A Python CLI script that fetches multiple RSS feeds within a given time range, u
 
 **Done when**: Strip formatting, images, image links, and hyperlinks. Each article saved to a markdown file. Private IP links rejected before calling Jina. Proper error handling. Tests written for: successful fetch, Jina request error, private IP rejection, empty-title filename fallback, empty Jina response body.
 
-## Sprint 3 — Call Deepseek API to summarize the article and rate a score based on a given criteria
+## Sprint 3 — Call Deepseek API to summarize the extracted article and rate based on a given criteria
 **Goal**: Use Deepseek API to summarize each article and assign a score.
-1. Read Deepseek API key from environment variable (e.g. `DEEPSEEK_API_KEY`) — never hardcode it
-2. Define scoring criteria as a constant `SCORE_PROMPT` (the prompt fed to the model)
-3. For each API call, send `SCORE_PROMPT` as `role: system` and the article content as `role: user` — do NOT concatenate them into a single string (prompt injection prevention)
-4. Set `response_format={'type': 'json_object'}` and include expected JSON format example in `SCORE_PROMPT` (DeepSeek JSON Output mode — guarantees valid JSON, no schema enforcement needed)
-5. Parse the API response with `json.loads()` to extract `summary` and `score` (scale: 0–100).
-   - If `score` is outside 0–100, retry the API call three times. If the second response is still out of range, log an error and skip the article.
-   - If `summary` or `score` is `null`, retry the API call three times. If the problem insists, print an error message and exit with `sys.exit(1)`.
-6. Sort all articles by score descending; use published time (closest to system time first) as the tiebreaker when scores are equal.
-7. All functions must have type hints.
 
-**Done when**: Each article has a summary and a numeric score; articles are sorted by score descending with published-time tiebreaker; API key loaded from environment variable; API errors are handled gracefully. Tests written for: valid API response, malformed JSON response, missing API key, score sorting, score out of range (retry), null summary/score.
+**API call specifics**:
+- **SDK**: `openai` Python package (OpenAI-compatible interface) — DeepSeek has no official SDK
+- **Base URL**: `https://api.deepseek.com` — fixed constant, define as `DEEPSEEK_BASE_URL`
+- **Model**: `deepseek-v4-flash` — define as `DEEPSEEK_MODEL` constant
+- Instantiate once: `OpenAI(api_key=..., base_url=DEEPSEEK_BASE_URL)`
+
+1. Remove all functions related to saving article content locally; keep article extraction and markdown-cleaning in memory, then send the cleaned content directly to the model.
+2. Read Deepseek API key from environment variable (e.g. `DEEPSEEK_API_KEY`) — never hardcode it.
+   - Only missing API key should immediately print an error and exit with `sys.exit(1)`.
+3. Define scoring criteria as a constant `SCORE_PROMPT` (the prompt fed to the model).
+4. For each API call, send `SCORE_PROMPT` as `role: system` and the article content as `role: user` — do NOT concatenate them into a single string (prompt injection prevention).
+5. Set `response_format={'type': 'json_object'}` and include expected JSON format example in `SCORE_PROMPT` (DeepSeek JSON Output mode).
+6. Parse the API response with `json.loads()` to extract `summary` and `score` (score must be `0` or `1`).
+   - Total attempts per article: at most 2 (initial 1 + retry 1).
+   - If `score` is outside `0` or `1`, print an error, retry once, and if still invalid then skip the article.
+   - If `summary` or `score` is `null`, print an error, retry once, and if still invalid then skip the article.
+   - If response JSON is malformed, print an error, retry once, and if still malformed then skip the article.
+7. For all skipped/problematic articles, store and display their Jina-cleaned original text and the specific errorin the final error section.
+8. Sort all valid articles by descending score; use published time (closest to system time first) as the tiebreaker when scores are equal.
+9. All functions must have type hints.
+
+**Done when**: Each valid article has a summary and a rating; articles are sorted by score descending with published-time tiebreaker; API key is loaded from environment variable; missing API key exits immediately; output/JSON/score/null errors are retried once and then skipped if still invalid; problematic articles and errors are listed with their Jina-cleaned original text at the end. Tests written for: valid API response, malformed JSON response (retry then skip), missing API key, score sorting, score out of range (retry then skip), null summary/score (retry then skip).
 
 ## Future Sprints (Sprint 4+)
 - **Sprint 4 — HTML generation**: Apply `html.escape()` to all external strings (titles, summaries) before writing into HTML to prevent XSS

@@ -1,5 +1,6 @@
-"""Tests for Sprint 1 & Sprint 2: RSS Feed Fetcher."""
+"""Tests for Sprint 1, Sprint 2 & Sprint 3: RSS Feed Fetcher."""
 
+import json
 import time
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
@@ -13,6 +14,8 @@ from fetcher import (
     FeedError,
     _parse_entries,
     _parse_published,
+    _redact,
+    call_deepseek,
     fetch_article_content,
     fetch_feed,
     get_utc_now,
@@ -20,8 +23,6 @@ from fetcher import (
     load_feeds,
     main,
     run,
-    sanitize_filename,
-    save_article,
     strip_markdown,
 )
 
@@ -301,7 +302,7 @@ class TestFetchFeedHttpErrors:
 
 
 class TestFetchFeedEmpty:
-    def test_empty_feed_prints_no_updates(self, capsys):
+    def test_empty_feed_returns_error(self, capsys):
         with (
             patch('fetcher.requests.get', return_value=_mock_response()),
             patch('fetcher.feedparser.parse', return_value=_make_feed([])),
@@ -309,9 +310,9 @@ class TestFetchFeedEmpty:
             articles, errors = fetch_feed('EmptyFeed', 'https://empty.example.com/rss', SINCE)
 
         assert articles == []
-        assert errors == []
+        assert len(errors) == 1
         captured = capsys.readouterr()
-        assert 'No updates found' in captured.out
+        assert 'No parseable entries' in captured.out
 
 
 # ---------------------------------------------------------------------------
@@ -379,7 +380,7 @@ class TestFetchFeedNormal:
             fetch_feed('GoodFeed', 'https://good.example.com/rss', SINCE)
 
         captured = capsys.readouterr()
-        assert 'No updates in the last' in captured.out
+        assert 'No update in the last' in captured.out
 
 
 # ---------------------------------------------------------------------------
@@ -537,8 +538,41 @@ class TestIsPrivateUrlException:
 
 
 # ---------------------------------------------------------------------------
-# load_feeds — OSError path
+# is_private_url — DNS rebinding protection (#1)
 # ---------------------------------------------------------------------------
+
+
+class TestIsPrivateUrlDnsRebinding:
+    def test_hostname_resolving_to_private_ip_is_blocked(self):
+        with patch('fetcher._resolve_host', return_value=['192.168.1.1']):
+            assert is_private_url('http://evil.example.com/feed') is True
+
+    def test_hostname_resolving_to_loopback_is_blocked(self):
+        with patch('fetcher._resolve_host', return_value=['127.0.0.1']):
+            assert is_private_url('http://rebind.example.com/feed') is True
+
+    def test_hostname_resolving_to_link_local_is_blocked(self):
+        with patch('fetcher._resolve_host', return_value=['169.254.1.1']):
+            assert is_private_url('http://rebind.example.com/feed') is True
+
+    def test_hostname_resolving_to_public_ip_is_allowed(self):
+        with patch('fetcher._resolve_host', return_value=['93.184.216.34']):
+            assert is_private_url('http://example.com/feed') is False
+
+    def test_hostname_dns_failure_fails_open(self):
+        """Unresolvable hostnames are allowed (fail-open) to avoid false positives."""
+        with patch('fetcher._resolve_host', return_value=[]):
+            assert is_private_url('http://nonexistent.invalid/feed') is False
+
+    @pytest.mark.parametrize('private_ip', [
+        '10.0.0.1', '172.16.0.1', '192.168.1.1',
+        '127.0.0.1', '169.254.1.1', '0.0.0.0',
+    ])
+    def test_all_private_resolved_ips_blocked(self, private_ip):
+        with patch('fetcher._resolve_host', return_value=[private_ip]):
+            assert is_private_url(f'http://attacker.example.com/feed') is True
+
+
 
 
 class TestLoadFeedsOsError:
@@ -562,7 +596,8 @@ class TestLoadFeedsOsError:
 
 
 class TestRun:
-    def test_run_returns_articles_and_errors(self, tmp_path):
+    def test_run_returns_articles_and_errors(self, tmp_path, monkeypatch):
+        monkeypatch.setenv('DEEPSEEK_API_KEY', 'test-key')
         feeds_file = tmp_path / 'feeds.txt'
         feeds_file.write_text('TestFeed=https://example.com/rss\n', encoding='utf-8')
 
@@ -576,16 +611,18 @@ class TestRun:
         error = FeedError(source='TestFeed', message='some error')
 
         with (
+            patch('fetcher.OpenAI'),
             patch('fetcher.fetch_feed', return_value=([article], [error])),
             patch('fetcher.fetch_article_content', return_value=('content', None)),
-            patch('fetcher.save_article', return_value='TestFeed_hello.md'),
+            patch('fetcher.call_deepseek', return_value=('Summary', 1, None)),
         ):
             articles, errors = run(str(feeds_file))
 
-        assert articles == [article]
-        assert errors == [error]
+        assert article in articles
+        assert error in errors
 
-    def test_run_fetch_article_error_collected(self, tmp_path):
+    def test_run_fetch_article_error_collected(self, tmp_path, monkeypatch):
+        monkeypatch.setenv('DEEPSEEK_API_KEY', 'test-key')
         feeds_file = tmp_path / 'feeds.txt'
         feeds_file.write_text('TestFeed=https://example.com/rss\n', encoding='utf-8')
 
@@ -599,20 +636,59 @@ class TestRun:
         jina_error = FeedError(source='TestFeed', message='Jina无法读取网页信息')
 
         with (
+            patch('fetcher.OpenAI'),
             patch('fetcher.fetch_feed', return_value=([article], [])),
             patch('fetcher.fetch_article_content', return_value=(None, jina_error)),
         ):
             articles, errors = run(str(feeds_file))
 
-        assert articles == [article]
+        assert articles == []
         assert jina_error in errors
 
-    def test_run_empty_feeds_file(self, tmp_path):
+    def test_run_missing_api_key_exits(self, tmp_path, monkeypatch):
+        monkeypatch.delenv('DEEPSEEK_API_KEY', raising=False)
+        feeds_file = tmp_path / 'feeds.txt'
+        feeds_file.write_text('TestFeed=https://example.com/rss\n', encoding='utf-8')
+        with (
+            patch('fetcher.load_dotenv'),  # prevent .env from restoring the key
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            run(str(feeds_file))
+        assert exc_info.value.code == 1
+
+    def test_run_empty_feeds_file(self, tmp_path, monkeypatch):
+        monkeypatch.setenv('DEEPSEEK_API_KEY', 'test-key')
         feeds_file = tmp_path / 'feeds.txt'
         feeds_file.write_text('# no feeds here\n', encoding='utf-8')
-        articles, errors = run(str(feeds_file))
+        with patch('fetcher.OpenAI'):
+            articles, errors = run(str(feeds_file))
         assert articles == []
         assert errors == []
+
+    def test_run_sorts_articles_by_score_descending(self, tmp_path, monkeypatch):
+        monkeypatch.setenv('DEEPSEEK_API_KEY', 'test-key')
+        feeds_file = tmp_path / 'feeds.txt'
+        feeds_file.write_text('Feed=https://example.com/rss\n', encoding='utf-8')
+
+        now = datetime.now(timezone.utc)
+        art_low = Article(source='Feed', title='Low', link='https://example.com/1',
+                          description=None, published=now)
+        art_high = Article(source='Feed', title='High', link='https://example.com/2',
+                           description=None, published=now)
+
+        with (
+            patch('fetcher.OpenAI'),
+            patch('fetcher.fetch_feed', return_value=([art_low, art_high], [])),
+            patch('fetcher.fetch_article_content', return_value=('content', None)),
+            patch('fetcher.call_deepseek', side_effect=[
+                ('Low summary', 0, None),
+                ('High summary', 1, None),
+            ]),
+        ):
+            articles, _ = run(str(feeds_file))
+
+        assert articles[0].score == 1
+        assert articles[1].score == 0
 
 
 # ---------------------------------------------------------------------------
@@ -634,55 +710,7 @@ class TestMain:
             main()
         captured = capsys.readouterr()
         assert '1 error(s) collected' in captured.out
-        assert 'Collected errors:' in captured.out
         assert '- oops' in captured.out
-
-
-# ---------------------------------------------------------------------------
-# sanitize_filename
-# ---------------------------------------------------------------------------
-
-
-class TestSanitizeFilename:
-    def test_basic_sanitization(self):
-        result = sanitize_filename('Hello World', 'https://example.com')
-        assert result == 'hello_world'
-
-    def test_spaces_replaced_with_underscore(self):
-        result = sanitize_filename('My Great Article', 'https://example.com')
-        assert '_' in result
-        assert ' ' not in result
-
-    def test_special_chars_removed(self):
-        result = sanitize_filename('Hello: World! (2024)', 'https://example.com')
-        assert ':' not in result
-        assert '!' not in result
-        assert '(' not in result
-
-    def test_truncated_to_50_chars(self):
-        long_title = 'a' * 100
-        result = sanitize_filename(long_title, 'https://example.com')
-        assert len(result) <= 50
-
-    def test_empty_title_falls_back_to_url_hash(self):
-        result = sanitize_filename('', 'https://example.com/article')
-        assert len(result) == 8
-        assert result.isalnum()
-
-    def test_non_ascii_title_falls_back_to_url_hash(self):
-        # After removing non-[a-z0-9_] chars, should be empty → fall back to hash
-        result = sanitize_filename('日本語タイトル', 'https://example.com/article')
-        assert len(result) == 8
-
-    def test_hash_fallback_is_deterministic(self):
-        url = 'https://example.com/specific-article'
-        result1 = sanitize_filename('', url)
-        result2 = sanitize_filename('', url)
-        assert result1 == result2
-
-    def test_mixed_valid_and_invalid_chars(self):
-        result = sanitize_filename('AI & ML: Top 10!', 'https://example.com')
-        assert result == 'ai__ml_top_10'
 
 
 # ---------------------------------------------------------------------------
@@ -839,50 +867,24 @@ class TestFetchArticleContent:
         captured = capsys.readouterr()
         assert 'Rejected' in captured.out
 
+    def test_link_with_newline_control_char_rejected(self):
+        """Issue #2: links with \\r\\n must be blocked before Jina call."""
+        article = _make_article(link='https://example.com/article\r\nX-Injected: value')
+        with patch('fetcher.requests.get') as mock_get:
+            content, error = fetch_article_content(article.source, article)
+            mock_get.assert_not_called()
+        assert content is None
+        assert error is not None
+        assert 'control characters' in error.message
 
-# ---------------------------------------------------------------------------
-# save_article
-# ---------------------------------------------------------------------------
+    def test_link_with_null_byte_rejected(self):
+        article = _make_article(link='https://example.com/article\x00')
+        with patch('fetcher.requests.get') as mock_get:
+            content, error = fetch_article_content(article.source, article)
+            mock_get.assert_not_called()
+        assert content is None
+        assert error is not None
 
-
-class TestSaveArticle:
-    def test_saves_file_to_cwd(self, tmp_path, monkeypatch):
-        monkeypatch.chdir(tmp_path)
-        filename = save_article('MySrc', 'My Title', 'https://example.com', 'content')
-        assert (tmp_path / filename).exists()
-
-    def test_filename_format(self, tmp_path, monkeypatch):
-        monkeypatch.chdir(tmp_path)
-        filename = save_article('MySrc', 'My Title', 'https://example.com', 'content')
-        assert filename.startswith('MySrc_')
-        assert filename.endswith('.md')
-
-    def test_file_content_written(self, tmp_path, monkeypatch):
-        monkeypatch.chdir(tmp_path)
-        filename = save_article('MySrc', 'My Title', 'https://example.com', 'Hello world')
-        text = (tmp_path / filename).read_text(encoding='utf-8')
-        assert text == 'Hello world'
-
-    def test_overwrites_existing_file(self, tmp_path, monkeypatch):
-        monkeypatch.chdir(tmp_path)
-        save_article('MySrc', 'My Title', 'https://example.com', 'first')
-        save_article('MySrc', 'My Title', 'https://example.com', 'second')
-        files = list(tmp_path.iterdir())
-        assert len(files) == 1
-        assert files[0].read_text(encoding='utf-8') == 'second'
-
-    def test_empty_title_uses_hash_in_filename(self, tmp_path, monkeypatch):
-        monkeypatch.chdir(tmp_path)
-        filename = save_article('MySrc', '', 'https://example.com/article', 'content')
-        # filename should be MySrc_<8-char-hash>.md
-        parts = filename.replace('.md', '').split('_', 1)
-        assert parts[0] == 'MySrc'
-        assert len(parts[1]) == 8
-
-
-# ---------------------------------------------------------------------------
-# strip_markdown — italic and edge cases
-# ---------------------------------------------------------------------------
 
 
 class TestStripMarkdownItalicAndEdge:
@@ -953,3 +955,222 @@ class TestParseEntriesMixed:
         articles, errors = _parse_entries('Src', entries, SINCE)
         assert articles == []
         assert errors == []
+
+
+# ---------------------------------------------------------------------------
+# call_deepseek
+# ---------------------------------------------------------------------------
+
+
+class TestCallDeepseek:
+    """Tests for call_deepseek — happy path, retry logic, and error handling."""
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _make_client(self, content: str) -> MagicMock:
+        """Mock OpenAI client that returns *content* on every call."""
+        client = MagicMock()
+        client.api_key = 'test-key'
+        mock_resp = MagicMock()
+        mock_resp.choices[0].message.content = content
+        client.chat.completions.create.return_value = mock_resp
+        return client
+
+    def _make_client_seq(self, *responses) -> MagicMock:
+        """Mock OpenAI client with sequential call results.
+
+        Each item in *responses* is either a plain string (returned as the
+        response content) or an Exception instance (raised on that call).
+        """
+        client = MagicMock()
+        client.api_key = 'test-key'
+        side_effects = []
+        for r in responses:
+            if isinstance(r, Exception):
+                side_effects.append(r)
+            else:
+                mock_resp = MagicMock()
+                mock_resp.choices[0].message.content = r
+                side_effects.append(mock_resp)
+        client.chat.completions.create.side_effect = side_effects
+        return client
+
+    def _valid_json(self, summary: str = 'Test summary', score: int = 1) -> str:
+        return json.dumps({'summary': summary, 'score': score})
+
+    # ------------------------------------------------------------------
+    # Happy path
+    # ------------------------------------------------------------------
+
+    def test_valid_response_score_1(self):
+        client = self._make_client(self._valid_json('AI news summary', 1))
+        summary, score, error = call_deepseek(client, 'article content', 'Src', 'Title')
+        assert summary == 'AI news summary'
+        assert score == 1
+        assert error is None
+
+    def test_valid_response_score_0(self):
+        client = self._make_client(self._valid_json('Not relevant', 0))
+        summary, score, error = call_deepseek(client, 'article content', 'Src', 'Title')
+        assert score == 0
+        assert error is None
+
+    def test_returns_str_and_int_types(self):
+        client = self._make_client(self._valid_json('Summary', 1))
+        summary, score, error = call_deepseek(client, 'content', 'Src', 'Title')
+        assert isinstance(summary, str)
+        assert isinstance(score, int)
+
+    @pytest.mark.parametrize('score', [0, 1])
+    def test_boundary_scores_accepted(self, score):
+        client = self._make_client(self._valid_json('Summary', score))
+        _, result_score, error = call_deepseek(client, 'content', 'Src', 'Title')
+        assert result_score == score
+        assert error is None
+
+    # ------------------------------------------------------------------
+    # Malformed JSON — retry logic
+    # ------------------------------------------------------------------
+
+    def test_malformed_json_retries_and_succeeds(self):
+        client = self._make_client_seq('not json', self._valid_json('OK', 1))
+        summary, score, error = call_deepseek(client, 'content', 'Src', 'Title')
+        assert summary == 'OK'
+        assert score == 1
+        assert error is None
+
+    @pytest.mark.parametrize('bad_response', ['', 'not json', '{bad: json}'])
+    def test_malformed_json_both_attempts_returns_feed_error(self, bad_response):
+        client = self._make_client_seq(bad_response, bad_response)
+        summary, score, error = call_deepseek(client, 'content', 'Src', 'Title')
+        assert summary is None
+        assert score is None
+        assert isinstance(error, FeedError)
+
+    # ------------------------------------------------------------------
+    # API exception — retry logic
+    # ------------------------------------------------------------------
+
+    def test_api_exception_retries_and_succeeds(self):
+        client = self._make_client_seq(Exception('API down'), self._valid_json('OK', 0))
+        summary, score, error = call_deepseek(client, 'content', 'Src', 'Title')
+        assert score == 0
+        assert error is None
+
+    def test_api_exception_both_attempts_returns_feed_error(self):
+        client = self._make_client_seq(Exception('fail'), Exception('fail'))
+        summary, score, error = call_deepseek(client, 'content', 'Src', 'Title')
+        assert summary is None
+        assert score is None
+        assert isinstance(error, FeedError)
+        assert error.source == 'Src'
+
+    # ------------------------------------------------------------------
+    # Score out of range — retry logic
+    # ------------------------------------------------------------------
+
+    def test_score_out_of_range_retries_and_succeeds(self):
+        bad = json.dumps({'summary': 'S', 'score': 5})
+        client = self._make_client_seq(bad, self._valid_json('S', 1))
+        summary, score, error = call_deepseek(client, 'content', 'Src', 'Title')
+        assert score == 1
+        assert error is None
+
+    def test_score_out_of_range_both_attempts_returns_feed_error(self):
+        bad = json.dumps({'summary': 'S', 'score': 99})
+        client = self._make_client_seq(bad, bad)
+        _, _, error = call_deepseek(client, 'content', 'Src', 'Title')
+        assert isinstance(error, FeedError)
+
+    @pytest.mark.parametrize('bad_score', [-1, 2, 0.5, 'yes'])
+    def test_invalid_scores_rejected(self, bad_score):
+        bad = json.dumps({'summary': 'S', 'score': bad_score})
+        client = self._make_client_seq(bad, bad)
+        _, _, error = call_deepseek(client, 'content', 'Src', 'Title')
+        assert isinstance(error, FeedError)
+
+    # ------------------------------------------------------------------
+    # Null summary / score — retry logic
+    # ------------------------------------------------------------------
+
+    def test_null_summary_retries_and_succeeds(self):
+        null_s = json.dumps({'summary': None, 'score': 1})
+        client = self._make_client_seq(null_s, self._valid_json('OK', 1))
+        summary, score, error = call_deepseek(client, 'content', 'Src', 'Title')
+        assert summary == 'OK'
+        assert error is None
+
+    def test_null_score_both_attempts_returns_feed_error(self):
+        null_score = json.dumps({'summary': 'S', 'score': None})
+        client = self._make_client_seq(null_score, null_score)
+        _, _, error = call_deepseek(client, 'content', 'Src', 'Title')
+        assert isinstance(error, FeedError)
+
+    def test_null_summary_both_attempts_returns_feed_error(self):
+        null_summary = json.dumps({'summary': None, 'score': 1})
+        client = self._make_client_seq(null_summary, null_summary)
+        _, _, error = call_deepseek(client, 'content', 'Src', 'Title')
+        assert isinstance(error, FeedError)
+
+    def test_missing_score_field_returns_feed_error(self):
+        missing_score = json.dumps({'summary': 'S'})
+        client = self._make_client_seq(missing_score, missing_score)
+        _, _, error = call_deepseek(client, 'content', 'Src', 'Title')
+        assert isinstance(error, FeedError)
+
+    def test_missing_summary_field_returns_feed_error(self):
+        missing_summary = json.dumps({'score': 1})
+        client = self._make_client_seq(missing_summary, missing_summary)
+        _, _, error = call_deepseek(client, 'content', 'Src', 'Title')
+        assert isinstance(error, FeedError)
+
+    # ------------------------------------------------------------------
+    # Error metadata
+    # ------------------------------------------------------------------
+
+    def test_error_contains_source(self):
+        client = self._make_client_seq(Exception('fail'), Exception('fail'))
+        _, _, error = call_deepseek(client, 'content', 'MySource', 'MyTitle')
+        assert error.source == 'MySource'
+
+    def test_error_message_contains_title(self):
+        client = self._make_client_seq(Exception('fail'), Exception('fail'))
+        _, _, error = call_deepseek(client, 'content', 'Src', 'ArticleTitle')
+        assert 'ArticleTitle' in error.message
+
+    def test_malformed_json_error_message_contains_title(self):
+        client = self._make_client_seq('bad json', 'bad json')
+        _, _, error = call_deepseek(client, 'content', 'Src', 'TargetTitle')
+        assert 'TargetTitle' in error.message
+
+    def test_api_key_redacted_in_exception_message(self, capsys):
+        """API key must not appear in printed error output (issue #4)."""
+        secret = 'sk-supersecretkey123'
+        exc_with_key = RuntimeError(f'Incorrect API key provided: {secret}')
+        client = self._make_client_seq(exc_with_key, exc_with_key)
+        client.api_key = secret
+        call_deepseek(client, 'content', 'Src', 'Title')
+        captured = capsys.readouterr()
+        assert secret not in captured.out
+        assert '<redacted>' in captured.out
+
+
+# ---------------------------------------------------------------------------
+# _redact
+# ---------------------------------------------------------------------------
+
+
+class TestRedact:
+    def test_replaces_secret(self):
+        assert _redact('Error: key=sk-abc123', 'sk-abc123') == 'Error: key=<redacted>'
+
+    def test_empty_secret_returns_unchanged(self):
+        assert _redact('some message', '') == 'some message'
+
+    def test_replaces_all_occurrences(self):
+        assert _redact('a sk-x b sk-x c', 'sk-x') == 'a <redacted> b <redacted> c'
+
+    def test_no_match_returns_unchanged(self):
+        assert _redact('no secret here', 'sk-notpresent') == 'no secret here'

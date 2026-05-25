@@ -1,9 +1,11 @@
-"""RSS Feed Fetcher — Foundation, Data Pipeline & Content Extraction."""
+"""RSS Feed Fetcher — Foundation, Data Pipeline, Content Extraction & AI Scoring."""
 
 import calendar
-import hashlib
 import ipaddress
+import json
+import os
 import re
+import socket
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -12,17 +14,41 @@ from urllib.parse import urlparse
 
 import feedparser
 import requests
+from dotenv import load_dotenv
+from openai import OpenAI
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-TIME_RANGE_HOURS: int = 48
+TIME_RANGE_HOURS: int = 72
+DEEPSEEK_BASE_URL: str = 'https://api.deepseek.com'
+DEEPSEEK_MODEL: str = 'deepseek-v4-flash'
+SCORE_PROMPT: str = """你是一名资深的科技编辑。你的读者包括AI agent产品经理、用户研究员以及全职程序员。请阅读用户提供的文字，完成两件事：
+1. 用英文总结文章，少于200字。复杂技术讲的简单有趣。
+2. 给出 score：如果文章属于优先分类给 1，不符合给 0。符合给1。
+   （1: a.模型与产品发布 b.AI agent c.企业使用案例 d.Human-AI interaction research e. Agent 与开发工程
+     0: 不属于得分1的所有分类）
+
+请只输出 json，格式如下：
+
+{
+    "summary": "这里是一句话摘要",
+    "score": 1
+}
+"""
 
 # ---------------------------------------------------------------------------
 # SSRF prevention — private / reserved host patterns
 # ---------------------------------------------------------------------------
 
+
+def _resolve_host(host: str) -> list[str]:
+    """Resolve *host* to IP address strings via DNS. Returns ``[]`` on any failure."""
+    try:
+        return [sockaddr[0] for *_, sockaddr in socket.getaddrinfo(host, None)]
+    except socket.gaierror:
+        return []
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -38,6 +64,8 @@ class Article:
     link: str
     description: Optional[str]
     published: datetime
+    summary: Optional[str] = None
+    score: Optional[int] = None
 
 
 @dataclass
@@ -46,6 +74,7 @@ class FeedError:
 
     source: str
     message: str
+    jina_content: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -63,7 +92,9 @@ def is_private_url(url: str) -> bool:
 
     Uses :mod:`ipaddress` for IP-literal hostnames, covering all private,
     loopback, link-local, reserved, and IPv4-mapped IPv6 addresses.
-    Non-IP hostnames are checked only for the literal string ``localhost``.
+    Non-IP hostnames are resolved via DNS; if any resolved address is private
+    the URL is blocked.  DNS failures are treated as non-private (fail-open)
+    to avoid false positives on temporarily unreachable hosts.
     """
     try:
         host: str = urlparse(url).hostname or ''
@@ -76,7 +107,22 @@ def is_private_url(url: str) -> bool:
     try:
         addr: ipaddress.IPv4Address | ipaddress.IPv6Address = ipaddress.ip_address(host)
     except ValueError:
-        # Hostname (not a bare IP literal) — allow; DNS-level checks are out of scope.
+        # Non-IP hostname — resolve via DNS to catch DNS-rebinding attacks.
+        for ip_str in _resolve_host(host):
+            try:
+                resolved: ipaddress.IPv4Address | ipaddress.IPv6Address = ipaddress.ip_address(ip_str)
+            except ValueError:
+                continue
+            if isinstance(resolved, ipaddress.IPv6Address) and resolved.ipv4_mapped is not None:
+                resolved = resolved.ipv4_mapped
+            if (
+                resolved.is_loopback
+                or resolved.is_private
+                or resolved.is_link_local
+                or resolved.is_reserved
+                or resolved.is_unspecified
+            ):
+                return True
         return False
     # Unwrap IPv4-mapped IPv6 (e.g. ::ffff:127.0.0.1) so the IPv4 checks apply.
     if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
@@ -256,22 +302,6 @@ def fetch_feed(
 # ---------------------------------------------------------------------------
 
 
-def sanitize_filename(title: str, url: str) -> str:
-    """Return a safe filename component derived from *title*.
-
-    Lowercases, replaces spaces with ``_``, removes non-alphanumeric-or-underscore
-    characters, and truncates to 50 characters.  If the result is empty (e.g. the
-    title was blank or entirely non-ASCII), falls back to the first 8 hex characters
-    of the MD5 hash of *url*.
-    """
-    name = title.lower().replace(' ', '_')
-    name = re.sub(r'[^a-z0-9_]', '', name)
-    name = name[:50]
-    if not name:
-        name = hashlib.md5(url.encode()).hexdigest()[:8]
-    return name
-
-
 def strip_markdown(text: str) -> str:
     """Remove images, image links, hyperlinks, and inline formatting from *text*.
 
@@ -310,6 +340,12 @@ def fetch_article_content(
         print(msg)
         return None, FeedError(source=source, message=msg)
 
+    # Reject links containing control characters (prevents HTTP header injection).
+    if any(c in article.link for c in ('\r', '\n', '\x00')):
+        msg = f'[{source}] Article link contains control characters; skipping: {article.link!r}'
+        print(msg)
+        return None, FeedError(source=source, message=msg)
+
     jina_url = f'https://r.jina.ai/{article.link}'
     jina_headers = {
         'X-Remove-Selector': 'nav, header, footer, aside',
@@ -336,17 +372,74 @@ def fetch_article_content(
     return strip_markdown(content), None
 
 
-def save_article(source: str, title: str, url: str, content: str) -> str:
-    """Save *content* to ``{source}_{sanitized_title}.md`` in the current directory.
+def _redact(text: str, secret: str) -> str:
+    """Replace *secret* in *text* with ``'<redacted>'`` to prevent credential leaks."""
+    if not secret:
+        return text
+    return text.replace(secret, '<redacted>')
 
-    Overwrites any pre-existing file with the same name.
-    Returns the filename that was written.
+
+def call_deepseek(
+    client: OpenAI,
+    content: str,
+    source: str,
+    title: str,
+) -> tuple[Optional[str], Optional[int], Optional[FeedError]]:
+    """Summarize and score *content* via the DeepSeek API. Retries once on any failure.
+
+    Returns ``(summary, score, None)`` on success or ``(None, None, FeedError)`` after
+    two failed attempts.  *score* is guaranteed to be ``0`` or ``1``.
     """
-    sanitized = sanitize_filename(title, url)
-    filename = f'{source}_{sanitized}.md'
-    with open(filename, 'w', encoding='utf-8') as fh:
-        fh.write(content)
-    return filename
+    last_error: str = f'[{source}] No attempts made for "{title}"'
+    for attempt in range(2):
+        try:
+            response = client.chat.completions.create(
+                model=DEEPSEEK_MODEL,
+                messages=[
+                    {'role': 'system', 'content': SCORE_PROMPT},
+                    {'role': 'user', 'content': content},
+                ],
+                response_format={'type': 'json_object'},
+            )
+            raw: str = response.choices[0].message.content or ''
+            data: dict = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            last_error = (
+                f'[{source}] Malformed JSON response for "{title}"'
+                f' (attempt {attempt + 1}): {exc}'
+            )
+            print(last_error)
+            continue
+        except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
+            last_error = (
+                f'[{source}] API error for "{title}"'
+                f' (attempt {attempt + 1}): {_redact(str(exc), client.api_key)}'
+            )
+            print(last_error)
+            continue
+
+        summary = data.get('summary')
+        score = data.get('score')
+
+        if summary is None or score is None:
+            last_error = (
+                f'[{source}] Null summary or score for "{title}"'
+                f' (attempt {attempt + 1})'
+            )
+            print(last_error)
+            continue
+
+        if score not in (0, 1):
+            last_error = (
+                f'[{source}] Score {score!r} out of range (0 or 1) for "{title}"'
+                f' (attempt {attempt + 1})'
+            )
+            print(last_error)
+            continue
+
+        return str(summary), int(score), None
+
+    return None, None, FeedError(source=source, message=last_error)
 
 
 # ---------------------------------------------------------------------------
@@ -354,8 +447,20 @@ def save_article(source: str, title: str, url: str, content: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def run(feeds_path: str = 'feeds.txt') -> tuple[list[Article], list[FeedError]]:
-    """Load feed sources, fetch all articles, and save content to markdown files."""
+def run(  # pylint: disable=too-many-locals
+    feeds_path: str = 'feeds.txt',
+) -> tuple[list[Article], list[FeedError]]:
+    """Load feed sources, fetch articles, summarize and score via DeepSeek, sort results."""
+    # Load local .env values (if present) without overriding existing process env.
+    load_dotenv()
+
+    api_key: Optional[str] = os.environ.get('DEEPSEEK_API_KEY')
+    if not api_key:
+        print('Error: DEEPSEEK_API_KEY environment variable is not set.')
+        sys.exit(1)
+
+    client: OpenAI = OpenAI(api_key=api_key, base_url=DEEPSEEK_BASE_URL)
+
     now: datetime = get_utc_now()
     since: datetime = now - timedelta(hours=TIME_RANGE_HOURS)
 
@@ -369,25 +474,47 @@ def run(feeds_path: str = 'feeds.txt') -> tuple[list[Article], list[FeedError]]:
         all_articles.extend(articles)
         all_errors.extend(errors)
 
+    valid_articles: list[Article] = []
     for article in all_articles:
-        content, error = fetch_article_content(article.source, article)
-        if error:
-            all_errors.append(error)
+        content, jina_error = fetch_article_content(article.source, article)
+        if jina_error:
+            all_errors.append(jina_error)
             continue
-        filename = save_article(article.source, article.title, article.link, content)
-        print(f'[{article.source}] Saved: {filename}')
 
-    return all_articles, all_errors
+        summary, score, api_error = call_deepseek(
+            client, content, article.source, article.title  # type: ignore[arg-type]
+        )
+        if api_error:
+            api_error.jina_content = content
+            all_errors.append(api_error)
+            continue
+
+        article.summary = summary
+        article.score = score
+        valid_articles.append(article)
+
+    # Sort by score descending; break ties by proximity to now (ascending delta)
+    valid_articles.sort(
+        key=lambda a: (-(a.score or 0), abs((now - a.published).total_seconds()))
+    )
+
+    return valid_articles, all_errors
 
 
 def main() -> None:
     """CLI entry point."""
-    _, errors = run()  # NOTE: Sprint 4 will pass articles to the HTML renderer
+    articles, errors = run()
+    for article in articles:
+        print(f'[{article.source}] {article.title}')
+        print(f'  {article.link}')
+        if article.summary:
+            print(f'  Summary: {article.summary}')
     if errors:
-        print(f'\n{len(errors)} error(s) collected (will be shown in the final digest).')
-        print('Collected errors:')
+        print(f'\n{len(errors)} error(s) collected:')
         for error in errors:
             print(f'- {error.message}')
+            if error.jina_content:
+                print(f'  [Article text preview]: {error.jina_content[:200]}...')
 
 
 if __name__ == '__main__':

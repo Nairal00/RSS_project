@@ -8,8 +8,8 @@ import pytest
 import requests
 
 from config import TIME_RANGE_HOURS
-from models import Article, FeedError
-from feed_fetcher import _parse_entries, _parse_published, fetch_feed, load_feeds
+from models import Article
+from feed_fetcher import _parse_entries, _parse_published, compute_since_window, fetch_feed, load_feeds
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +107,19 @@ class TestLoadFeeds:
         captured = capsys.readouterr()
         assert 'Skipping' in captured.out
 
+    def test_control_chars_in_url_skipped(self, tmp_path, capsys):
+        feeds_file = tmp_path / 'feeds.txt'
+        # Write raw bytes so a NUL byte survives Python's text-mode newline handling.
+        feeds_file.write_bytes(
+            b'EvilFeed=https://example.com/feed\x00evil\n'
+            b'GoodFeed=https://good.example.com/feed\n'
+        )
+        result = load_feeds(str(feeds_file))
+        assert 'EvilFeed' not in result
+        assert 'GoodFeed' in result
+        captured = capsys.readouterr()
+        assert 'control' in captured.out.lower()
+
 
 class TestLoadFeedsOsError:
     def test_os_error_exits(self):
@@ -158,7 +171,7 @@ class TestFetchFeedPrivateIp:
         assert 'Rejected' in errors[0].message
 
     def test_private_ip_no_http_call(self):
-        with patch('feed_fetcher.requests.get') as mock_get:
+        with patch('feed_fetcher.safe_get') as mock_get:
             fetch_feed('TestSource', 'http://10.0.0.1/rss', SINCE)
             mock_get.assert_not_called()
 
@@ -183,7 +196,10 @@ class TestFetchFeedHttpErrors:
         mock_response = _mock_response()
         mock_response.raise_for_status.side_effect = http_err
 
-        with patch('feed_fetcher.requests.get', return_value=mock_response):
+        with (
+            patch('feed_fetcher.is_private_url', return_value=False),
+            patch('feed_fetcher.safe_get', return_value=mock_response),
+        ):
             articles, errors = fetch_feed('BadFeed', 'https://bad.example.com/rss', SINCE)
 
         assert articles == []
@@ -199,14 +215,20 @@ class TestFetchFeedHttpErrors:
         mock_response = _mock_response()
         mock_response.raise_for_status.side_effect = http_err
 
-        with patch('feed_fetcher.requests.get', return_value=mock_response):
+        with (
+            patch('feed_fetcher.is_private_url', return_value=False),
+            patch('feed_fetcher.safe_get', return_value=mock_response),
+        ):
             fetch_feed('BadFeed', 'https://bad.example.com/rss', SINCE)
 
         captured = capsys.readouterr()
         assert 'HTTP error' in captured.out
 
     def test_connection_error_logged(self):
-        with patch('feed_fetcher.requests.get', side_effect=requests.ConnectionError('timeout')):
+        with (
+            patch('feed_fetcher.is_private_url', return_value=False),
+            patch('feed_fetcher.safe_get', side_effect=requests.ConnectionError('timeout')),
+        ):
             articles, errors = fetch_feed('BadFeed', 'https://bad.example.com/rss', SINCE)
 
         assert articles == []
@@ -222,7 +244,8 @@ class TestFetchFeedHttpErrors:
 class TestFetchFeedEmpty:
     def test_empty_feed_returns_error(self, capsys):
         with (
-            patch('feed_fetcher.requests.get', return_value=_mock_response()),
+            patch('feed_fetcher.is_private_url', return_value=False),
+            patch('feed_fetcher.safe_get', return_value=_mock_response()),
             patch('feed_fetcher.feedparser.parse', return_value=_make_feed([])),
         ):
             articles, errors = fetch_feed('EmptyFeed', 'https://empty.example.com/rss', SINCE)
@@ -242,7 +265,8 @@ class TestFetchFeedNormal:
     def test_returns_articles(self):
         entries = [_make_entry()]
         with (
-            patch('feed_fetcher.requests.get', return_value=_mock_response()),
+            patch('feed_fetcher.is_private_url', return_value=False),
+            patch('feed_fetcher.safe_get', return_value=_mock_response()),
             patch('feed_fetcher.feedparser.parse', return_value=_make_feed(entries)),
         ):
             articles, errors = fetch_feed('GoodFeed', 'https://good.example.com/rss', SINCE)
@@ -258,7 +282,8 @@ class TestFetchFeedNormal:
     def test_article_not_printed_during_fetch(self, capsys):
         entries = [_make_entry(title='My Title', link='https://example.com/x')]
         with (
-            patch('feed_fetcher.requests.get', return_value=_mock_response()),
+            patch('feed_fetcher.is_private_url', return_value=False),
+            patch('feed_fetcher.safe_get', return_value=_mock_response()),
             patch('feed_fetcher.feedparser.parse', return_value=_make_feed(entries)),
         ):
             fetch_feed('GoodFeed', 'https://good.example.com/rss', SINCE)
@@ -270,7 +295,8 @@ class TestFetchFeedNormal:
     def test_old_articles_excluded(self):
         entries = [_make_entry(published_parsed=OLD_STRUCT)]
         with (
-            patch('feed_fetcher.requests.get', return_value=_mock_response()),
+            patch('feed_fetcher.is_private_url', return_value=False),
+            patch('feed_fetcher.safe_get', return_value=_mock_response()),
             patch('feed_fetcher.feedparser.parse', return_value=_make_feed(entries)),
         ):
             articles, errors = fetch_feed('GoodFeed', 'https://good.example.com/rss', SINCE)
@@ -281,7 +307,8 @@ class TestFetchFeedNormal:
     def test_description_populated(self):
         entries = [_make_entry(summary='Test summary')]
         with (
-            patch('feed_fetcher.requests.get', return_value=_mock_response()),
+            patch('feed_fetcher.is_private_url', return_value=False),
+            patch('feed_fetcher.safe_get', return_value=_mock_response()),
             patch('feed_fetcher.feedparser.parse', return_value=_make_feed(entries)),
         ):
             articles, _ = fetch_feed('GoodFeed', 'https://good.example.com/rss', SINCE)
@@ -292,7 +319,8 @@ class TestFetchFeedNormal:
         """All entries are old — fetch_feed returns ([], []) without printing."""
         entries = [_make_entry(published_parsed=OLD_STRUCT)]
         with (
-            patch('feed_fetcher.requests.get', return_value=_mock_response()),
+            patch('feed_fetcher.is_private_url', return_value=False),
+            patch('feed_fetcher.safe_get', return_value=_mock_response()),
             patch('feed_fetcher.feedparser.parse', return_value=_make_feed(entries)),
         ):
             articles, errors = fetch_feed('GoodFeed', 'https://good.example.com/rss', SINCE)
@@ -312,7 +340,7 @@ class TestFetchFeedBrokenLink:
     def test_empty_link_skipped_with_error(self):
         entries = [_make_entry(link='')]
         with (
-            patch('feed_fetcher.requests.get', return_value=_mock_response()),
+            patch('feed_fetcher.safe_get', return_value=_mock_response()),
             patch('feed_fetcher.feedparser.parse', return_value=_make_feed(entries)),
         ):
             articles, errors = fetch_feed('Src', 'https://example.com/rss', SINCE)
@@ -324,7 +352,7 @@ class TestFetchFeedBrokenLink:
     def test_non_http_link_skipped_with_error(self):
         entries = [_make_entry(link='ftp://example.com/article')]
         with (
-            patch('feed_fetcher.requests.get', return_value=_mock_response()),
+            patch('feed_fetcher.safe_get', return_value=_mock_response()),
             patch('feed_fetcher.feedparser.parse', return_value=_make_feed(entries)),
         ):
             articles, errors = fetch_feed('Src', 'https://example.com/rss', SINCE)
@@ -335,7 +363,7 @@ class TestFetchFeedBrokenLink:
     def test_broken_link_error_contains_source(self):
         entries = [_make_entry(link='')]
         with (
-            patch('feed_fetcher.requests.get', return_value=_mock_response()),
+            patch('feed_fetcher.safe_get', return_value=_mock_response()),
             patch('feed_fetcher.feedparser.parse', return_value=_make_feed(entries)),
         ):
             _, errors = fetch_feed('MySrc', 'https://example.com/rss', SINCE)
@@ -345,7 +373,7 @@ class TestFetchFeedBrokenLink:
     def test_broken_link_error_contains_published_time(self):
         entries = [_make_entry(link='')]
         with (
-            patch('feed_fetcher.requests.get', return_value=_mock_response()),
+            patch('feed_fetcher.safe_get', return_value=_mock_response()),
             patch('feed_fetcher.feedparser.parse', return_value=_make_feed(entries)),
         ):
             _, errors = fetch_feed('MySrc', 'https://example.com/rss', SINCE)
@@ -364,7 +392,7 @@ class TestFetchFeedMalformedPublished:
         entry = _make_entry()
         entry['published_parsed'] = None
         with (
-            patch('feed_fetcher.requests.get', return_value=_mock_response()),
+            patch('feed_fetcher.safe_get', return_value=_mock_response()),
             patch('feed_fetcher.feedparser.parse', return_value=_make_feed([entry])),
         ):
             articles, errors = fetch_feed('Src', 'https://example.com/rss', SINCE)
@@ -376,7 +404,7 @@ class TestFetchFeedMalformedPublished:
         entry = _make_entry()
         entry['published_parsed'] = 'not-a-struct'
         with (
-            patch('feed_fetcher.requests.get', return_value=_mock_response()),
+            patch('feed_fetcher.safe_get', return_value=_mock_response()),
             patch('feed_fetcher.feedparser.parse', return_value=_make_feed([entry])),
         ):
             articles, errors = fetch_feed('Src', 'https://example.com/rss', SINCE)
@@ -388,7 +416,7 @@ class TestFetchFeedMalformedPublished:
         entry = _make_entry(title='Bad Entry', link='https://example.com/bad')
         entry['published_parsed'] = None
         with (
-            patch('feed_fetcher.requests.get', return_value=_mock_response()),
+            patch('feed_fetcher.safe_get', return_value=_mock_response()),
             patch('feed_fetcher.feedparser.parse', return_value=_make_feed([entry])),
         ):
             _, errors = fetch_feed('Src', 'https://example.com/rss', SINCE)
@@ -415,11 +443,42 @@ class TestParseEntriesArticlePrivateLink:
         _, errors = _parse_entries('MySrc', entries, SINCE)
         assert errors[0].source == 'MySrc'
 
+
+# ---------------------------------------------------------------------------
+# compute_since_window
+# ---------------------------------------------------------------------------
+
+
+class TestComputeSinceWindow:
+    def test_returns_utc_midnight_minus_time_range(self):
+        now = datetime(2026, 6, 1, 15, 30, 45, tzinfo=timezone.utc)
+        result = compute_since_window(now)
+        expected = datetime(2026, 5, 31, 0, 0, 0, tzinfo=timezone.utc)
+        assert result == expected
+
+    def test_exactly_at_midnight(self):
+        now = datetime(2026, 6, 1, 0, 0, 0, tzinfo=timezone.utc)
+        result = compute_since_window(now)
+        expected = datetime(2026, 5, 31, 0, 0, 0, tzinfo=timezone.utc)
+        assert result == expected
+
+    def test_result_is_utc_aware(self):
+        now = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        result = compute_since_window(now)
+        assert result.tzinfo == timezone.utc
+
+    def test_window_equals_time_range_hours(self):
+        now = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        utc_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        result = compute_since_window(now)
+        delta = utc_midnight - result
+        assert delta == timedelta(hours=TIME_RANGE_HOURS)
+
     def test_private_article_link_via_fetch_feed(self):
         """Ensure private article links are also caught through fetch_feed."""
         entries = [_make_entry(link='http://127.0.0.1/article')]
         with (
-            patch('feed_fetcher.requests.get', return_value=_mock_response()),
+            patch('feed_fetcher.safe_get', return_value=_mock_response()),
             patch('feed_fetcher.feedparser.parse', return_value=_make_feed(entries)),
         ):
             articles, errors = fetch_feed('Src', 'https://example.com/rss', SINCE)

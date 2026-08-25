@@ -1,11 +1,12 @@
 """HTML digest generation for newsletter-style output."""
 
+import webbrowser
 from datetime import datetime
 from html import escape
-from urllib.parse import urlparse
+from pathlib import Path
+
 from config import TIME_RANGE_HOURS
-
-
+from validators import is_http_url
 from models import Article, FeedError
 
 
@@ -22,7 +23,6 @@ _CSS = (
     '.title{margin:0;font:700 32px/36px georgia,serif;color:#286ed0;}'
     '.date{margin:6px 0 0 0;font:400 14px/20px arial,sans-serif;color:#666;}'
     '.intro{margin:14px 0 8px 0;font:italic 400 18px/24px georgia,serif;color:#333;}'
-    '.footer{border-top:1px solid #dcdcdc;padding:12px 0 4px 0;font:400 12px/18px arial,sans-serif;color:#666;}'
     '@media (max-width:480px){'
     '.wrap{margin:0 auto;}'
     '.pad{padding-left:14px!important;padding-right:14px!important;}'
@@ -33,8 +33,7 @@ _CSS = (
 
 def _safe_href(link: str) -> str:
     """Allow only http/https links for anchors; return empty string otherwise."""
-    parsed = urlparse(link)
-    if parsed.scheme in ('http', 'https'):
+    if is_http_url(link):
         return link
     return ''
 
@@ -58,7 +57,7 @@ def _render_head(title: str, date_str: str) -> str:
         '<table role="presentation" class="wrap"><tr><td class="pad" style="padding:0 24px;">'
         f'<div class="header"><h1 class="title">{escaped_title}</h1>'
         f'<p class="date">{date_str}</p></div>'
-        f'<p class="intro"> Updates from the past {TIME_RANGE_HOURS} hours, sorted by AI.</p>'
+        f'<p class="intro">Updates from the past {TIME_RANGE_HOURS} hours, sorted by AI.</p>'
     )
 
 
@@ -88,7 +87,7 @@ def _render_articles(articles: list[Article]) -> str:
         return (
             '<tr><td style="border-top:1px solid #dcdcdc;padding:20px 0 18px 0;">'
             '<p style="margin:0;font:400 17px/22.5px georgia,serif;color:#333;">'
-            f'No update in the past {TIME_RANGE_HOURS} hours.</p></td></tr>'
+            'No updates in the selected time window.</p></td></tr>'
         )
     return ''.join(_render_article_row(a) for a in articles)
 
@@ -111,7 +110,7 @@ def _render_details(errors: list[FeedError], silent_sources: list[str]) -> str:
     return (
         '<tr><td style="border-top:1px solid #dcdcdc;padding:14px 0 6px 0;">'
         '<p style="margin:0 0 8px 0;font:600 13px/18px arial,sans-serif;color:#000;">'
-        'No update or errors:</p>'
+        'Notes:</p>'
         '<ul style="margin:0;padding-left:20px;font:400 13px/18px arial,sans-serif;color:#333;">'
         + ''.join(rows)
         + '</ul></td></tr>'
@@ -134,3 +133,25 @@ def generate_html(
         + '</table>'
         + '</td></tr></table></td></tr></table></body></html>'
     )
+
+
+def write_digest(html: str, output_path: str) -> Path:
+    """Write *html* to *output_path* and return the resolved path.
+
+    The resolved path must remain inside the current working directory to
+    prevent path-traversal attacks when a future CLI ``--output`` flag is added.
+
+    Raises :class:`ValueError` if *output_path* escapes the working directory.
+    """
+    path: Path = Path(output_path).resolve()
+    allowed_dir: Path = Path.cwd().resolve()
+    if not path.is_relative_to(allowed_dir):
+        raise ValueError(f'Output path escapes working directory: {path}')
+    with open(path, 'w', encoding='utf-8') as fh:
+        fh.write(html)
+    return path
+
+
+def open_digest(path: Path) -> None:
+    """Open *path* in the system default browser via a ``file://`` URI."""
+    webbrowser.open(path.as_uri())

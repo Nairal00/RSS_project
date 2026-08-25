@@ -1,6 +1,6 @@
 """Project-wide constants."""
 
-TIME_RANGE_HOURS: int = 24
+TIME_RANGE_HOURS: int = 96
 NEWSLETTER_TITLE: str = 'Daily Digest'
 HTML_OUTPUT_PATH: str = 'digest.html'
 
@@ -10,6 +10,7 @@ MAX_CONTENT_CHARS: int = 8_000  # prevents runaway token cost and narrows inject
 DEEPSEEK_BASE_URL: str = 'https://api.deepseek.com'
 DEEPSEEK_MODEL: str = 'deepseek-v4-flash'
 
+CONTROL_CHARS: tuple[str, ...] = ('\r', '\n', '\x00')
 FEED_FETCH_TIMEOUT: int = 15   # seconds; HTTP timeout for RSS feed fetches
 JINA_BASE_URL: str = 'https://r.jina.ai/'
 JINA_TIMEOUT: int = 30         # seconds; HTTP timeout for Jina reader requests

@@ -2,16 +2,25 @@
 
 import calendar
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
-from urllib.parse import urlparse
-
 import feedparser
 import requests
 
-from config import FEED_FETCH_TIMEOUT
+from config import FEED_FETCH_TIMEOUT, TIME_RANGE_HOURS
 from models import Article, FeedError
-from validators import is_private_url
+from validators import has_control_chars, is_http_url, is_private_url, safe_get
+
+
+def compute_since_window(now: datetime) -> datetime:
+    """Return the start of the time window for feed filtering.
+
+    Anchors to UTC midnight of *now*, then subtracts ``TIME_RANGE_HOURS``.
+    This always covers exactly the 24 hours before Beijing 08:00 regardless of
+    when the program runs.
+    """
+    utc_midnight: datetime = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return utc_midnight - timedelta(hours=TIME_RANGE_HOURS)
 
 
 def load_feeds(path: str) -> dict[str, str]:
@@ -30,8 +39,11 @@ def load_feeds(path: str) -> dict[str, str]:
                 if '=' in line:
                     name, _, url = line.partition('=')
                     name, url = name.strip(), url.strip()
-                    if urlparse(url).scheme not in ('http', 'https'):
+                    if not is_http_url(url):
                         print(f'[{name}] Skipping feed with invalid URL scheme: {url}')
+                        continue
+                    if has_control_chars(url):
+                        print(f'[{name}] Skipping feed URL with control characters: {url!r}')
                         continue
                     feeds[name] = url
     except FileNotFoundError:
@@ -91,7 +103,7 @@ def _parse_entries(
             break
 
         # --- Validate link format ---
-        if not link or not link.startswith(('http://', 'https://')):
+        if not link or not is_http_url(link):
             msg = (
                 f'[{source}] Empty or broken link for article '
                 f'published at {published.isoformat()}; skipping.'
@@ -144,7 +156,7 @@ def fetch_feed(
 
     # --- HTTP fetch ---
     try:
-        response = requests.get(url, timeout=FEED_FETCH_TIMEOUT)
+        response = safe_get(url, timeout=FEED_FETCH_TIMEOUT)
         response.raise_for_status()
     except requests.HTTPError as exc:
         status = exc.response.status_code if exc.response is not None else 'N/A'
@@ -152,7 +164,7 @@ def fetch_feed(
         print(msg)
         errors.append(FeedError(source=source, message=msg))
         return articles, errors
-    except requests.RequestException as exc:
+    except (ValueError, requests.RequestException) as exc:
         msg = f'[{source}] Request error: {exc}'
         print(msg)
         errors.append(FeedError(source=source, message=msg))

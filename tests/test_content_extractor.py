@@ -3,11 +3,10 @@
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
-import pytest
 import requests
 
 from content_extractor import fetch_article_content, strip_markdown
-from models import Article, FeedError
+from models import Article
 
 
 # ---------------------------------------------------------------------------
@@ -36,6 +35,7 @@ def _mock_jina_response(text: str = 'Article content', status_code: int = 200) -
     """Build a mock requests.Response for Jina calls."""
     resp = MagicMock()
     resp.status_code = status_code
+    resp.encoding = 'utf-8'
     resp.text = text
     resp.raise_for_status = MagicMock()
     return resp
@@ -107,7 +107,10 @@ class TestFetchArticleContent:
     def test_successful_fetch_returns_content(self):
         article = _make_article()
         mock_resp = _mock_jina_response(text='# Article\n\nSome content here.')
-        with patch('content_extractor.requests.get', return_value=mock_resp):
+        with (
+            patch('content_extractor.is_private_url', return_value=False),
+            patch('content_extractor.safe_get', return_value=mock_resp),
+        ):
             content, error = fetch_article_content(article.source, article)
         assert content is not None
         assert error is None
@@ -116,7 +119,10 @@ class TestFetchArticleContent:
         article = _make_article()
         raw = 'Check ![img](https://img.example.com/a.png) and [click](https://x.com).'
         mock_resp = _mock_jina_response(text=raw)
-        with patch('content_extractor.requests.get', return_value=mock_resp):
+        with (
+            patch('content_extractor.is_private_url', return_value=False),
+            patch('content_extractor.safe_get', return_value=mock_resp),
+        ):
             content, error = fetch_article_content(article.source, article)
         assert '![' not in content
         assert 'https://x.com' not in content
@@ -130,7 +136,10 @@ class TestFetchArticleContent:
         http_err.response = mock_resp
         mock_response = _mock_jina_response()
         mock_response.raise_for_status.side_effect = http_err
-        with patch('content_extractor.requests.get', return_value=mock_response):
+        with (
+            patch('content_extractor.is_private_url', return_value=False),
+            patch('content_extractor.safe_get', return_value=mock_response),
+        ):
             content, error = fetch_article_content(article.source, article)
         assert content is None
         assert error is not None
@@ -138,7 +147,10 @@ class TestFetchArticleContent:
 
     def test_jina_request_exception_returns_feed_error(self):
         article = _make_article()
-        with patch('content_extractor.requests.get', side_effect=requests.ConnectionError('timeout')):
+        with (
+            patch('content_extractor.is_private_url', return_value=False),
+            patch('content_extractor.safe_get', side_effect=requests.ConnectionError('timeout')),
+        ):
             content, error = fetch_article_content(article.source, article)
         assert content is None
         assert error is not None
@@ -146,7 +158,7 @@ class TestFetchArticleContent:
 
     def test_private_ip_rejected_before_jina(self):
         article = _make_article(link='http://192.168.1.1/article')
-        with patch('content_extractor.requests.get') as mock_get:
+        with patch('content_extractor.safe_get') as mock_get:
             content, error = fetch_article_content(article.source, article)
             mock_get.assert_not_called()
         assert content is None
@@ -156,7 +168,10 @@ class TestFetchArticleContent:
     def test_empty_jina_response_returns_error(self):
         article = _make_article()
         mock_resp = _mock_jina_response(text='   ')
-        with patch('content_extractor.requests.get', return_value=mock_resp):
+        with (
+            patch('content_extractor.is_private_url', return_value=False),
+            patch('content_extractor.safe_get', return_value=mock_resp),
+        ):
             content, error = fetch_article_content(article.source, article)
         assert content is None
         assert error is not None
@@ -166,14 +181,20 @@ class TestFetchArticleContent:
         monkeypatch.chdir(tmp_path)
         article = _make_article()
         mock_resp = _mock_jina_response(text='')
-        with patch('content_extractor.requests.get', return_value=mock_resp):
+        with (
+            patch('content_extractor.is_private_url', return_value=False),
+            patch('content_extractor.safe_get', return_value=mock_resp),
+        ):
             fetch_article_content(article.source, article)
         assert list(tmp_path.iterdir()) == []
 
     def test_jina_url_constructed_correctly(self):
         article = _make_article(link='https://example.com/some-article')
         mock_resp = _mock_jina_response(text='content')
-        with patch('content_extractor.requests.get', return_value=mock_resp) as mock_get:
+        with (
+            patch('content_extractor.is_private_url', return_value=False),
+            patch('content_extractor.safe_get', return_value=mock_resp) as mock_get,
+        ):
             fetch_article_content(article.source, article)
         called_url = mock_get.call_args[0][0]
         assert called_url == 'https://r.jina.ai/https://example.com/some-article'
@@ -187,7 +208,10 @@ class TestFetchArticleContent:
     def test_link_with_newline_control_char_rejected(self):
         """Links with \\r\\n must be blocked before Jina call."""
         article = _make_article(link='https://example.com/article\r\nX-Injected: value')
-        with patch('content_extractor.requests.get') as mock_get:
+        with (
+            patch('content_extractor.is_private_url', return_value=False),
+            patch('content_extractor.safe_get') as mock_get,
+        ):
             content, error = fetch_article_content(article.source, article)
             mock_get.assert_not_called()
         assert content is None
@@ -196,8 +220,65 @@ class TestFetchArticleContent:
 
     def test_link_with_null_byte_rejected(self):
         article = _make_article(link='https://example.com/article\x00')
-        with patch('content_extractor.requests.get') as mock_get:
+        with patch('content_extractor.safe_get') as mock_get:
             content, error = fetch_article_content(article.source, article)
             mock_get.assert_not_called()
         assert content is None
         assert error is not None
+
+
+# ---------------------------------------------------------------------------
+# fetch_article_content — oversized response
+# ---------------------------------------------------------------------------
+
+
+class TestFetchArticleContentOversized:
+    def test_oversized_bytes_response_returns_error(self):
+        """Stream path: raw.read returns bytes exceeding MAX_RESPONSE_BYTES."""
+        from config import MAX_RESPONSE_BYTES  # noqa: PLC0415
+        article = _make_article()
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.encoding = 'utf-8'
+        resp.raw.read.return_value = b'x' * (MAX_RESPONSE_BYTES + 1)
+        with (
+            patch('content_extractor.is_private_url', return_value=False),
+            patch('content_extractor.safe_get', return_value=resp),
+        ):
+            content, error = fetch_article_content(article.source, article)
+        assert content is None
+        assert error is not None
+        assert 'too large' in error.message
+
+    def test_normal_bytes_response_returns_content(self):
+        """Stream path: raw.read returns valid bytes within limit."""
+        article = _make_article()
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.encoding = 'utf-8'
+        resp.raw.read.return_value = b'Normal article content.'
+        with (
+            patch('content_extractor.is_private_url', return_value=False),
+            patch('content_extractor.safe_get', return_value=resp),
+        ):
+            content, error = fetch_article_content(article.source, article)
+        assert content == 'Normal article content.'
+        assert error is None
+
+    def test_oversized_text_response_returns_error(self):
+        """Compat path: raw.read returns a non-bytes value; text exceeds MAX_RESPONSE_BYTES."""
+        from config import MAX_RESPONSE_BYTES  # noqa: PLC0415
+        article = _make_article()
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.encoding = 'utf-8'
+        resp.raw.read.return_value = 'not-bytes'
+        resp.text = 'x' * (MAX_RESPONSE_BYTES + 1)
+        with (
+            patch('content_extractor.is_private_url', return_value=False),
+            patch('content_extractor.safe_get', return_value=resp),
+        ):
+            content, error = fetch_article_content(article.source, article)
+        assert content is None
+        assert error is not None
+        assert 'too large' in error.message

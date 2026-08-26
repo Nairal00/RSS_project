@@ -1,5 +1,7 @@
 .env
 cache.json
-output.html
+digest.html
 __pycache__/
 *.pyc
+.coverage
+.DS_Store

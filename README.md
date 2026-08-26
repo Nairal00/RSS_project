@@ -90,7 +90,7 @@ pip install -r requirements.txt
 
 ### 配置 RSS 源
 
-编辑 `feeds.txt`，每行一条源，推荐使用 `名称=URL` 形式：
+编辑 `feeds.txt`，每行一条源，使用 `名称=URL` 形式：
 
 ```text
 tech=https://example.com/feed.xml
